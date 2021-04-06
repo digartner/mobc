@@ -252,17 +252,11 @@ fn test_drop_on_checkin() {
 
 #[test]
 fn test_health_check_interval() {
-    static DROPPED: AtomicBool = AtomicBool::new(false);
-    DROPPED.store(false, Ordering::SeqCst);
+    static CHECKED: AtomicBool = AtomicBool::new(false);
+    CHECKED.store(false, Ordering::SeqCst);
     let mut rt: Runtime = Runtime::new().unwrap();
 
     struct Connection;
-
-    impl Drop for Connection {
-        fn drop(&mut self) {
-            DROPPED.store(true, Ordering::SeqCst);
-        }
-    }
 
     struct Handler;
 
@@ -276,6 +270,7 @@ fn test_health_check_interval() {
         }
 
         async fn check(&self, _conn: Self::Connection) -> Result<Self::Connection, Self::Error> {
+            CHECKED.store(true, Ordering::SeqCst);
             Err(TestError)
         }
     }
@@ -290,14 +285,14 @@ fn test_health_check_interval() {
 
         assert!(pool.get().await.is_ok());
         delay_for(Duration::from_millis(500)).await;
-        assert!(!DROPPED.load(Ordering::SeqCst));
+        assert!(!CHECKED.load(Ordering::SeqCst));
 
         assert!(pool.get().await.is_ok());
-        assert!(!DROPPED.load(Ordering::SeqCst));
+        assert!(!CHECKED.load(Ordering::SeqCst));
 
         delay_for(Duration::from_millis(600)).await;
         assert!(pool.get().await.is_ok());
-        assert!(DROPPED.load(Ordering::SeqCst));
+        assert!(CHECKED.load(Ordering::SeqCst));
 
         Ok::<(), Error<TestError>>(())
     })
@@ -306,49 +301,46 @@ fn test_health_check_interval() {
 
 #[test]
 fn test_invalid_conn() {
-    static DROPPED: AtomicBool = AtomicBool::new(false);
-    DROPPED.store(false, Ordering::SeqCst);
     let mut rt: Runtime = Runtime::new().unwrap();
-
-    struct Connection;
-
-    impl Drop for Connection {
-        fn drop(&mut self) {
-            DROPPED.store(true, Ordering::SeqCst);
-        }
+    struct Handler {
+        num: AtomicIsize,
     }
-
-    struct Handler;
 
     #[async_trait]
     impl Manager for Handler {
-        type Connection = Connection;
+        type Connection = FakeConnection;
         type Error = TestError;
 
         async fn connect(&self) -> Result<Self::Connection, Self::Error> {
-            Ok(Connection)
+            if self.num.fetch_sub(1, Ordering::SeqCst) > 0 {
+                Ok(FakeConnection(true))
+            } else {
+                Err(TestError)
+            }
         }
 
         async fn check(&self, _conn: Self::Connection) -> Result<Self::Connection, Self::Error> {
             Err(TestError)
         }
     }
-
     rt.block_on(async {
-        let pool = Pool::builder().max_open(1).build(Handler);
+        let handler = Handler {
+            num: AtomicIsize::new(1),
+        };
+
+        let pool = Pool::builder().max_open(1).build(handler);
 
         assert!(pool.get().await.is_ok());
         delay_for(Duration::from_secs(1)).await;
-        assert!(pool.get().await.is_ok());
-        assert!(DROPPED.load(Ordering::SeqCst));
-        assert_eq!(1_u64, pool.state().await.connections);
+        assert!(pool.get().await.is_err());
+        assert_eq!(0_u64, pool.state().await.connections);
         Ok::<(), Error<TestError>>(())
     })
     .unwrap();
 }
 
 #[test]
-fn test_invalid_conn_recovery() {
+fn test_health_check_recovery() {
     let mut rt: Runtime = Runtime::new().unwrap();
 
     struct Handler {
@@ -402,7 +394,7 @@ fn test_lazy_initialization_failure() {
         let err = pool.get().await.err().unwrap();
         match err {
             Error::Inner(TestError) => (),
-            _ => panic!("{:?} expected"),
+            _ => panic!("TestError expected"),
         }
 
         Ok::<(), Error<TestError>>(())
